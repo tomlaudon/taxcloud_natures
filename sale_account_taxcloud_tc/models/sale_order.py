@@ -93,7 +93,6 @@ class SaleOrder(models.Model):
 
         # warning: this is tightly coupled to TaxCloudRequest's _process_lines method
         # do not modify without syncing the other method
-        tax_cache = {}  # tax_rate → account.tax record
         for index, line in enumerate(
             self.order_line.filtered(lambda x: not x.display_type)
         ):
@@ -117,46 +116,50 @@ class SaleOrder(models.Model):
                     line.tax_id.amount, tax_rate, precision_digits=3
                 ):
                     tax_rate = float_round(tax_rate, precision_digits=3)
-                    if tax_rate in tax_cache:
-                        tax = tax_cache[tax_rate]
-                    else:
-                        tax = (
-                            self.env["account.tax"]
-                            .sudo().search(
-                                [
-                                    *self.env["account.tax"]._check_company_domain(company),
-                                    ("amount", "=", tax_rate),
-                                    ("amount_type", "=", "percent"),
-                                    ("type_tax_use", "=", "sale"),
-                                ],
-                                limit=1,
-                            )
+                    tax = (
+                        self.env["account.tax"]
+                        # .with_context(active_test=False)
+                        .sudo().search(
+                            [
+                                *self.env["account.tax"]._check_company_domain(company),
+                                ("amount", "=", tax_rate),
+                                ("amount_type", "=", "percent"),
+                                ("type_tax_use", "=", "sale"),
+                            ],
+                            limit=1,
                         )
-                        if not tax:
-                            if company.is_default_tax_template:
-                                values = company.tax_template_id.copy_data({
+                    )
+                    if not tax:
+                        # Only set if not already set, otherwise it triggers a
+                        # needless and potentially heavy recompute for
+                        # everything related to the tax.
+                        # if not tax.active:
+                            # Needs to be active to be included in order total computation
+                    #         tax.active = True
+                    # else:
+                        if company.is_default_tax_template:
+                            values = company.tax_template_id.copy_data({
+                                "name": "Tax %.3f %%" % (tax_rate),
+                                "amount": tax_rate,
+                                "invoice_label": "TaxCloud Tax",
+                                "active": True
+                            })
+                        else:
+                            values = {
                                     "name": "Tax %.3f %%" % (tax_rate),
                                     "amount": tax_rate,
-                                    "invoice_label": "TaxCloud Tax",
-                                    "active": True
-                                })
-                            else:
-                                values = {
-                                        "name": "Tax %.3f %%" % (tax_rate),
-                                        "amount": tax_rate,
-                                        "amount_type": "percent",
-                                        "type_tax_use": "sale",
-                                        "description": "Sales Tax",
-                                    }
-                            tax = (
-                                self.env["account.tax"]
-                                .sudo()
-                                .with_context(default_company_id=company.id)
-                                .create(
-                                    values
-                                )
+                                    "amount_type": "percent",
+                                    "type_tax_use": "sale",
+                                    "description": "Sales Tax",
+                                }
+                        tax = (
+                            self.env["account.tax"]
+                            .sudo()
+                            .with_context(default_company_id=company.id)
+                            .create(
+                                values
                             )
-                        tax_cache[tax_rate] = tax
+                        )
                     line.tax_id = tax
         return True
 

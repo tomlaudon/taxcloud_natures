@@ -43,11 +43,6 @@ class AccountMove(models.Model):
         if self._context.get("move_reverse_cancel"):
             return super()._post(soft)
 
-        # Skip TaxCloud validation when taxes were already set from a
-        # validated SO (e.g. membership invoice auto-posted during confirm).
-        if self._context.get("skip_taxcloud_invoice_validation"):
-            return super()._post(soft)
-
         refund_with_out_reverse = self.filtered(lambda move: move.fiscal_position_id.is_taxcloud and move.move_type == "out_refund" and not move.reversed_entry_id)
         if refund_with_out_reverse:
             raise UserError(
@@ -143,7 +138,6 @@ class AccountMove(models.Model):
         raise_warning = False
         taxes_to_set = []
         tax_value_index = 0
-        tax_cache = {}  # tax_rate → account.tax record
         for index, line in enumerate(self.invoice_line_ids):
             if line.display_type in ("line_note", "line_section"):
                 taxes_to_set.append((index, 0))
@@ -172,47 +166,50 @@ class AccountMove(models.Model):
                 ):
                     raise_warning = True
                     tax_rate = float_round(tax_rate, precision_digits=3)
-                    if tax_rate in tax_cache:
-                        tax = tax_cache[tax_rate]
-                    else:
-                        tax = (
-                            self.env["account.tax"]
-                            .sudo()
-                            .search(
-                                [
-                                    *self.env["account.tax"]._check_company_domain(company),
-                                    ("amount", "=", tax_rate),
-                                    ("amount_type", "=", "percent"),
-                                    ("type_tax_use", "=", "sale"),
-                                ],
-                                limit=1,
-                            )
+                    tax = (
+                        self.env["account.tax"]
+                        .sudo()
+                        .search(
+                            [
+                                *self.env["account.tax"]._check_company_domain(company),
+                                ("amount", "=", tax_rate),
+                                ("amount_type", "=", "percent"),
+                                ("type_tax_use", "=", "sale"),
+                            ],
+                            limit=1,
                         )
-                        if not tax:
-                            if company.is_default_tax_template:
-                                values = company.tax_template_id.copy_data({
-                                    "name": "Tax %.3f %%" % (tax_rate),
-                                    "amount": tax_rate,
-                                    "invoice_label": "TaxCloud Tax",
-                                    "active": True
-                                })
-                            else:
-                                values = {
-                                            "name": "Tax %.3f %%" % (tax_rate),
-                                            "amount": tax_rate,
-                                            "amount_type": "percent",
-                                            "type_tax_use": "sale",
-                                            "description": "Sales Tax",
-                                        }
-                            tax = (
-                                    self.env["account.tax"]
-                                    .sudo()
-                                    .with_context(default_company_id=company.root_id.id)
-                                    .create(
-                                        values
-                                    )
+                    )
+                    if not tax:
+                        # Only set if not already set, otherwise it triggers a
+                        # needless and potentially heavy recompute for
+                        # everything related to the tax.
+                        # if not tax.active:
+                            # Needs to be active to be included in invoice total computation
+                            # tax.active = True
+                    # else:
+                        if company.is_default_tax_template:
+                            values = company.tax_template_id.copy_data({
+                                "name": "Tax %.3f %%" % (tax_rate),
+                                "amount": tax_rate,
+                                "invoice_label": "TaxCloud Tax",
+                                "active": True
+                            })
+                        else:
+                            values = {
+                                        "name": "Tax %.3f %%" % (tax_rate),
+                                        "amount": tax_rate,
+                                        "amount_type": "percent",
+                                        "type_tax_use": "sale",
+                                        "description": "Sales Tax",
+                                    }
+                        tax = (
+                                self.env["account.tax"]
+                                .sudo()
+                                .with_context(default_company_id=company.root_id.id)
+                                .create(
+                                    values
                                 )
-                        tax_cache[tax_rate] = tax
+                            )
                     taxes_to_set.append((index, tax))
 
         for index, tax in taxes_to_set:
