@@ -238,8 +238,12 @@ class AccountMove(models.Model):
                         origin_invoice, self.invoice_date
                     )
                     if response.ResponseType == "Error":
-                        raise ValidationError(
-                            response.Messages.ResponseMessage[0].Message
+                        _logger.warning(
+                            "TaxCloud could not mark order as returned for credit note %s "
+                            "(original invoice %s): %s — continuing without TaxCloud update.",
+                            self.name,
+                            origin_invoice.name,
+                            response.Messages.ResponseMessage[0].Message,
                         )
                 else:
                     _logger.warning(
