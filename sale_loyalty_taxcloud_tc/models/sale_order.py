@@ -15,13 +15,12 @@ class SaleOrder(models.Model):
         return TaxCloudRequest(api_id, api_key)
 
     def _update_programs_and_rewards(self, block=False):
-        """Before we apply the discounts, we clean up any preset tax
-        that might already since it may mess up the discount computation.
-        """
-        taxcloud_orders = self.filtered("fiscal_position_id.is_taxcloud")
-        taxcloud_orders.order_line.write({"tax_id": [(Command.CLEAR,)]})
+        """Compute rewards with taxes present, then re-validate via TaxCloud.
+        The original implementation cleared taxes before computing rewards,
+        which caused all discount amounts to be $0."""
         res = super()._update_programs_and_rewards()
-        for order in taxcloud_orders.filtered(lambda x:x.order_line):
+        taxcloud_orders = self.filtered("fiscal_position_id.is_taxcloud")
+        for order in taxcloud_orders.filtered(lambda x: x.order_line):
             order.validate_taxes_on_sales_order()
         return res
 
