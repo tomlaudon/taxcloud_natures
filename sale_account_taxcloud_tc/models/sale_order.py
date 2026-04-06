@@ -173,20 +173,17 @@ class SaleOrder(models.Model):
         return res
 
     def write(self, vals):
-        res = super().write(vals)
-        for order in self:
-            if (
-                order.is_taxcloud
-                and order.state == "sale"
-                and "partner_shipping_id" in vals
-            ):
-                raise UserError(
-                    "You can't change the delivery address once \
-the sale order is confirmed when using TaxCloud."
-                    "\nIf you still need to change the delivery address, \
-please reset the order to a quotation and then update the delivery address."
-                )
-        return res
+        if "partner_shipping_id" in vals:
+            for order in self:
+                if order.is_taxcloud and order.state == "sale":
+                    raise UserError(
+                        "You can't change the delivery address once "
+                        "the sale order is confirmed when using TaxCloud."
+                        "\nIf you still need to change the delivery address, "
+                        "please reset the order to a quotation and then "
+                        "update the delivery address."
+                    )
+        return super().write(vals)
 
     @api.onchange("partner_shipping_id")
     def _onchange_warning_partner_shipping_id(self):
