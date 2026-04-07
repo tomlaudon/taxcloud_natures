@@ -173,7 +173,7 @@ class SaleOrder(models.Model):
         return res
 
     def write(self, vals):
-        if "partner_shipping_id" in vals:
+        if "partner_shipping_id" in vals and not self.env.context.get("update_delivery_shipping_partner"):
             for order in self:
                 if order.is_taxcloud and order.state == "sale":
                     raise UserError(
