@@ -158,6 +158,19 @@ class SaleOrder(models.Model):
                             )
                         tax_cache[tax_rate] = tax
                     line.tax_id = tax
+
+        # Negative / reward lines were skipped by TaxCloud. Copy the tax
+        # from the corresponding positive product line so the tax amounts
+        # cancel properly (e.g. free-month PATH coupon).
+        positive_lines = {}  # product_id → tax record
+        for line in self.order_line.filtered(lambda x: not x.display_type):
+            if line.price_unit >= 0 and line.product_uom_qty >= 0 and line.product_id and line.tax_id:
+                positive_lines[line.product_id.id] = line.tax_id
+        for line in self.order_line.filtered(lambda x: not x.display_type):
+            if line.price_unit < 0 or line.product_uom_qty < 0:
+                matched_tax = positive_lines.get(line.product_id.id)
+                if matched_tax:
+                    line.tax_id = matched_tax
         return True
 
     def add_option_to_order_with_taxcloud(self):

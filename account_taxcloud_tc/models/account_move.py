@@ -215,11 +215,31 @@ class AccountMove(models.Model):
                         tax_cache[tax_rate] = tax
                     taxes_to_set.append((index, tax))
 
+        # Apply computed taxes to positive lines
+        tax_by_index = dict(taxes_to_set)
         for index, tax in taxes_to_set:
             line = self.invoice_line_ids[index]
             if line.display_type not in ("line_note", "line_section"):
                 line.tax_ids = False
                 line.tax_ids = tax
+
+        # Negative / reward lines were skipped by TaxCloud. Copy the tax
+        # from the corresponding positive product line so the tax amounts
+        # cancel properly (e.g. free-month PATH coupon).
+        positive_lines = {}  # product_id → tax record
+        for index, tax in taxes_to_set:
+            line = self.invoice_line_ids[index]
+            if tax and line.product_id and line.price_unit >= 0:
+                positive_lines[line.product_id.id] = tax
+        for line in self.invoice_line_ids:
+            if line.display_type in ("line_note", "line_section"):
+                continue
+            if line.price_unit < 0 or line.quantity < 0:
+                # Try to match by product
+                matched_tax = positive_lines.get(line.product_id.id)
+                if matched_tax:
+                    line.tax_ids = False
+                    line.tax_ids = matched_tax
 
         if self.env.context.get("taxcloud_authorize_transaction"):
             reporting_date = self.get_taxcloud_reporting_date()
