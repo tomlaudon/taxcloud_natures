@@ -180,10 +180,17 @@ class SaleOrder(models.Model):
             self.validate_taxes_on_sales_order()
 
     def action_confirm(self):
-        res = super().action_confirm()
+        # Validate taxes BEFORE super so any tax_id writes happen while
+        # the SO is still draft. Core `sale.action_confirm` flips
+        # `locked=True` inside super, and `sale_order_line._get_protected_fields()`
+        # includes `tax_id` — any post-super tax_id write raises
+        # `UserError: "It is forbidden to modify the following fields in
+        # a locked order: Taxes"`. Observed on SO2581429 2026-04-22
+        # 09:41 UTC: payment.transaction post-processing retry-looped for
+        # 15+ attempts, SO stayed in draft, user's payment was stuck.
         for order in self:
             order.validate_taxes_on_sales_order()
-        return res
+        return super().action_confirm()
 
     def write(self, vals):
         if "partner_shipping_id" in vals and not self.env.context.get("update_delivery_shipping_partner"):
