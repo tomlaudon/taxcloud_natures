@@ -291,6 +291,16 @@ class AccountMove(models.Model):
                 request = TaxCloudRequest(api_id, api_key)
                 if invoice.move_type == "out_invoice":
                     request.get_taxcloud_captured(invoice)
+                # Gift-card / loyalty discount credit notes (NW's
+                # is_coupon_used flag) aren't reversals of a taxable
+                # invoice — they're accounting moves that work alongside
+                # the original sale's gift-card payment. Tax was already
+                # charged on the actual sale amount, so taxcloud has
+                # nothing to do. Skip silently rather than logging a
+                # misleading "source document on the refund is not
+                # valid" WARN that AR sees on every loyalty refund.
+                elif getattr(invoice, 'is_coupon_used', False):
+                    continue
                 else:
                     request.set_invoice_items_detail(invoice)
                     origin_invoice = invoice.reversed_entry_id
