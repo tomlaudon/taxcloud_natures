@@ -301,7 +301,7 @@ class AccountMove(models.Model):
                 # valid" WARN that AR sees on every loyalty refund.
                 elif getattr(invoice, 'is_coupon_used', False):
                     continue
-                else:
+                elif invoice.move_type == "out_refund":
                     request.set_invoice_items_detail(invoice)
                     origin_invoice = invoice.reversed_entry_id
                     if origin_invoice:
@@ -313,6 +313,16 @@ class AccountMove(models.Model):
                             """ taxcloud account""",
                             invoice.id,
                         )
+                # in_invoice / in_refund / entry / other move types:
+                # TaxCloud is sales-side only. Some vendor bills get
+                # tagged with a taxcloud fiscal_position by data quirk
+                # (the position-by-state default applies before the
+                # bill's vendor-vs-customer context is established), so
+                # they'd otherwise fall through to the refund branch and
+                # log a misleading "source document on the refund X is
+                # not valid" WARN. Skip silently.
+                else:
+                    continue
 
         return super()._invoice_paid_hook()
 

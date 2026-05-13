@@ -20,7 +20,7 @@
       This module computes the sales tax on the Invoice using Tax Cloud API.
     """,
     "category": "Accounting/Accounting",
-    "version": "1.0.4",
+    "version": "1.0.5",
     "depends": ["account", "l10n_us"],
     "data": [
         "security/ir.model.access.csv",
