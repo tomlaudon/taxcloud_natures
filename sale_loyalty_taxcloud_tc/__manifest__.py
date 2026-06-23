@@ -4,7 +4,7 @@
     Manage discounts in taxclouds computations.
     """,
     "category": "Accounting",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "depends": ["sale_account_taxcloud_tc", "sale_loyalty"],
     "auto_install": True,
     "license": "LGPL-3",

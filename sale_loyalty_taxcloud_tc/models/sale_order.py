@@ -30,6 +30,12 @@ class SaleOrder(models.Model):
         requires that any negative amount of a coupon line be deduced from the
         lines it originated from, these cannot be invoiced separately as it be
         incoherent with what was computed on the order.
+
+        Only reward lines that carry a negative amount (true discount / coupon
+        lines that must be spread back onto their origin lines) can produce that
+        faulty tax computation. Free-product rewards net $0 (100% discount) and
+        have nothing to spread, so they must NOT block partial invoicing — else
+        a "buy X get free Y" promo strands the whole order at invoicing time.
         """
 
         def not_totally_invoiceable(order):
@@ -38,8 +44,14 @@ class SaleOrder(models.Model):
                 for line in order.order_line
             )
 
+        def has_negative_reward(order):
+            return any(
+                line.reward_id and line.price_subtotal < 0
+                for line in order.order_line
+            )
+
         taxcloud_orders = self.filtered("fiscal_position_id.is_taxcloud")
-        taxcloud_coupon_orders = taxcloud_orders.filtered("order_line.reward_id")
+        taxcloud_coupon_orders = taxcloud_orders.filtered(has_negative_reward)
         partial_taxcloud_coupon_orders = taxcloud_coupon_orders.filtered(
             not_totally_invoiceable
         )
