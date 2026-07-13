@@ -169,7 +169,11 @@ class SaleOrder(models.Model):
         for line in self.order_line.filtered(lambda x: not x.display_type):
             if line.price_unit < 0 or line.product_uom_qty < 0:
                 matched_tax = positive_lines.get(line.product_id.id)
-                if matched_tax:
+                # Only reassign when it actually differs — writing the same
+                # Many2many value still fires a (6,0,...) that deletes and
+                # re-inserts the tax<->line relation rows, causing avoidable
+                # write churn and row-lock contention on confirm under load.
+                if matched_tax and line.tax_id != matched_tax:
                     line.tax_id = matched_tax
         return True
 

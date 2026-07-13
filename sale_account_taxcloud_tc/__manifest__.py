@@ -21,7 +21,7 @@
     """,
     "category": "Accounting/Accounting",
     "depends": ["account_taxcloud_tc", "sale", "sale_management"],
-    "version": "1.0.3",
+    "version": "1.0.4",
     "data": [
         "views/sale_order_views.xml",
         "views/res_config_settings_views.xml",
