@@ -35,6 +35,22 @@ class AccountMove(models.Model):
     # Technical field to determine whether to hide taxes in views or not
     is_taxcloud = fields.Boolean(related="fiscal_position_id.is_taxcloud")
     total_tax_amount_tc = fields.Float("TaxCloud Total Tax")
+    # NW: set True on a posted sales invoice that still owes TaxCloud its
+    # AuthorizedWithCapture report (the compliance "this sale completed, remit
+    # the tax" call). The tax itself is still computed + verified inline at
+    # post (the LookupForDate below runs synchronously, so the invoice total
+    # and the payment capture are correct before we return), but the
+    # AuthorizedWithCapture SOAP round-trip is deferred to the
+    # `_cron_taxcloud_capture` cron so it doesn't sit on the warehouse barcode
+    # Validate click. That report never changes the invoice total, the amount
+    # captured from the customer, or anything the customer sees -- only
+    # TaxCloud's own remittance record -- so sending it a couple of minutes
+    # later is safe. Kill switch: ir.config_parameter
+    # `account_taxcloud_tc.defer_capture` (set to anything but "True" to go
+    # back to capturing inline at post).
+    nw_taxcloud_capture_pending = fields.Boolean(
+        string="TaxCloud Capture Pending", copy=False, index=True,
+    )
 
     def _post(self, soft=True):
         # OVERRIDE
@@ -245,6 +261,11 @@ class AccountMove(models.Model):
             reporting_date = self.get_taxcloud_reporting_date()
 
             if self.move_type == "out_invoice":
+                # NOTE: on NW's stack this branch is shadowed by
+                # account_taxcloud_enh.validate_taxes_on_invoice, which owns the
+                # live AuthorizedWithCapture + the defer gate. This vanilla
+                # branch stays inline so the base module behaves correctly on
+                # its own (without the enh layer). See _cron_taxcloud_capture.
                 response = request.get_taxcloud_authorize_with_capture(
                     self, reporting_date
                 )
@@ -281,6 +302,75 @@ class AccountMove(models.Model):
             }
         else:
             return True
+
+    def _nw_taxcloud_capture_report(self):
+        """Send this posted invoice's deferred TaxCloud AuthorizedWithCapture
+        (the remittance report). Runs off the barcode-Validate path from
+        `_cron_taxcloud_capture`. Raises on failure so the caller can leave the
+        pending flag set and retry on the next sweep.
+
+        This does NOT touch the invoice's lines or total -- those were set +
+        posted inline. It only re-uses `prepare_taxcloud_request` (so the
+        exemption certificate, origin/destination and cart items match what was
+        posted) and fires the report.
+        """
+        self.ensure_one()
+        request = self.prepare_taxcloud_request()
+        if len(request.cart_items.CartItem) == 0:
+            # Nothing taxable to report (e.g. an all-zero invoice). Done.
+            return
+        reporting_date = self.get_taxcloud_reporting_date()
+        response = request.get_taxcloud_authorize_with_capture(self, reporting_date)
+        if getattr(response, "ResponseType", None) == "Error":
+            # The cart TaxCloud registered from the post-time Lookup may have
+            # aged out before this ran. Re-register it with a fresh Lookup
+            # (get_all_taxes_values only returns values -- it never edits the
+            # posted invoice) and retry the capture once.
+            lookup = request.get_all_taxes_values()
+            if lookup.get("error_message"):
+                raise ValidationError(
+                    self.env._("TaxCloud lookup failed during deferred capture: ")
+                    + lookup["error_message"]
+                )
+            response = request.get_taxcloud_authorize_with_capture(
+                self, reporting_date
+            )
+            if getattr(response, "ResponseType", None) == "Error":
+                raise ValidationError(response.Messages.ResponseMessage[0].Message)
+        # Mark authorized so the account_taxcloud_enh dedup guard
+        # (`not taxcloud_is_authorized`) never lets it be captured twice.
+        if "taxcloud_is_authorized" in self._fields:
+            self.taxcloud_is_authorized = True
+
+    @api.model
+    def _cron_taxcloud_capture(self, limit=200):
+        """Send the TaxCloud AuthorizedWithCapture reports deferred at post.
+
+        Each invoice runs in its own savepoint: a TaxCloud/network error on one
+        rolls back only that invoice (keeping its pending flag for the next
+        run) instead of aborting the batch or poisoning the cursor.
+        """
+        pending = self.search(
+            [
+                ("nw_taxcloud_capture_pending", "=", True),
+                ("state", "=", "posted"),
+                ("move_type", "=", "out_invoice"),
+            ],
+            limit=limit,
+        )
+        for invoice in pending:
+            try:
+                with self.env.cr.savepoint():
+                    invoice._nw_taxcloud_capture_report()
+                    invoice.nw_taxcloud_capture_pending = False
+            except Exception:
+                _logger.exception(
+                    "Deferred TaxCloud capture failed for invoice %s (id %s); "
+                    "leaving it pending to retry next run",
+                    invoice.name,
+                    invoice.id,
+                )
+        return True
 
     def _invoice_paid_hook(self):
         for invoice in self:

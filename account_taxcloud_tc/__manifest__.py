@@ -20,7 +20,7 @@
       This module computes the sales tax on the Invoice using Tax Cloud API.
     """,
     "category": "Accounting/Accounting",
-    "version": "1.0.5",
+    "version": "1.0.6",
     "depends": ["account", "l10n_us"],
     "data": [
         "security/ir.model.access.csv",
@@ -30,6 +30,7 @@
         "views/account_invoice_views.xml",
         "data/account_taxcloud_tc_data.xml",
         "data/mail_template_data.xml",
+        "data/taxcloud_capture_cron.xml",
     ],
     "license": "LGPL-3",
     "author": "Odoo S.A., Sodexis, TaxCloud",

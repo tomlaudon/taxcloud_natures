@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <data noupdate="1">
+        <!--
+        NW: sends the TaxCloud AuthorizedWithCapture remittance reports that
+        account_move.validate_taxes_on_invoice deferred at post time, so that
+        external SOAP call stays off the synchronous warehouse barcode Validate
+        click. Invoice tax + totals are always computed inline at post; only
+        this back-office report is deferred. See nw_taxcloud_capture_pending.
+        -->
+        <record id="ir_cron_nw_taxcloud_capture" model="ir.cron">
+            <field name="name">TaxCloud: Send Deferred Invoice Captures</field>
+            <field name="model_id" ref="account.model_account_move" />
+            <field name="state">code</field>
+            <field name="code">model._cron_taxcloud_capture()</field>
+            <field name="interval_number">3</field>
+            <field name="interval_type">minutes</field>
+            <field name="active" eval="True" />
+        </record>
+
+        <!-- Kill switch: set to anything but "True" to capture inline at post. -->
+        <record id="nw_taxcloud_defer_capture_param" model="ir.config_parameter">
+            <field name="key">account_taxcloud_tc.defer_capture</field>
+            <field name="value">True</field>
+        </record>
+    </data>
+</odoo>
