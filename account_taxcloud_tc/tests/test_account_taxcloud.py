@@ -1,6 +1,13 @@
+from odoo.tests import tagged
+
 from .common import TestAccountTaxcloudCommon
 
 
+# post_install for the same reason as test_nw_deferred_capture: at_install runs
+# before account_taxcloud_exemption_tc is in the registry, so the fixture
+# partner misses the required tax_number_type default and setUpClass dies on the
+# NOT NULL column. Without this the whole class is unrunnable on a real NW DB.
+@tagged("post_install", "-at_install")
 class TestAccountTaxcloud(TestAccountTaxcloudCommon):
     def test_01_taxcloud_tax_rate_on_invoice(self):
         """Test TaxRate Returned from taxcloud assign on invoice line"""
