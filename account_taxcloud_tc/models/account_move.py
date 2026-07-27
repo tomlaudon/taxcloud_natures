@@ -406,7 +406,17 @@ class AccountMove(models.Model):
         Each invoice runs in its own savepoint: a TaxCloud/network error on one
         rolls back only that invoice (keeping its pending flag for the next
         run) instead of aborting the batch or poisoning the cursor.
+
+        A lock_timeout is set for the same reason the batch is savepointed: this
+        cron writes account_move / account_move_line rows that a user-facing
+        pack-Validate (invoice post + reconcile, which recomputes
+        amount_residual) may be holding. Waiting on that lock deepens the
+        contention that shows up as reconcile deadlocks; the pending flag means
+        giving up costs nothing but a 3-minute delay. Ordered by id so
+        successive runs contend in a consistent sequence rather than crossing
+        over each other.
         """
+        self.env.cr.execute("SET LOCAL lock_timeout = '5s'")
         pending = self.search(
             [
                 ("nw_taxcloud_capture_pending", "=", True),
@@ -414,6 +424,7 @@ class AccountMove(models.Model):
                 ("move_type", "=", "out_invoice"),
             ],
             limit=limit,
+            order="id",
         )
         for invoice in pending:
             try:
