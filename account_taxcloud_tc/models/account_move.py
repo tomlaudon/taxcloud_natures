@@ -303,6 +303,41 @@ class AccountMove(models.Model):
         else:
             return True
 
+    @api.model
+    def _nw_taxcloud_error_message(self, response):
+        """First message off a TaxCloud Error response, defensively.
+
+        The old code reached straight into
+        `response.Messages.ResponseMessage[0].Message` inside the raise, so a
+        response shaped even slightly differently (Messages None, empty list)
+        turned a clean ValidationError into an AttributeError/IndexError from
+        inside the error path -- same endless retry, less obvious log.
+        """
+        messages = getattr(response, "Messages", None)
+        entries = getattr(messages, "ResponseMessage", None) or []
+        for entry in entries:
+            message = getattr(entry, "Message", None)
+            if message:
+                return message
+        return "TaxCloud returned an error with no message"
+
+    @api.model
+    def _nw_taxcloud_already_captured(self, response):
+        """True when TaxCloud is telling us this cart is ALREADY captured.
+
+        TaxCloud answers a repeat AuthorizedWithCapture for the same cart with
+        ResponseType 'Error' and a message like "This transaction has already
+        been marked as authorized (CartID : 1007249)". That is an idempotency
+        acknowledgement, not a failure -- the tax is remitted. Treating it as a
+        failure is what made the deferred-capture cron retry one invoice
+        forever, so match it narrowly (this phrasing only) and let every other
+        error still raise.
+        """
+        message = (self._nw_taxcloud_error_message(response) or "").lower()
+        return "already been marked as" in message and (
+            "authorized" in message or "captured" in message
+        )
+
     def _nw_taxcloud_capture_report(self):
         """Send this posted invoice's deferred TaxCloud AuthorizedWithCapture
         (the remittance report). Runs off the barcode-Validate path from
@@ -322,21 +357,43 @@ class AccountMove(models.Model):
         reporting_date = self.get_taxcloud_reporting_date()
         response = request.get_taxcloud_authorize_with_capture(self, reporting_date)
         if getattr(response, "ResponseType", None) == "Error":
-            # The cart TaxCloud registered from the post-time Lookup may have
-            # aged out before this ran. Re-register it with a fresh Lookup
-            # (get_all_taxes_values only returns values -- it never edits the
-            # posted invoice) and retry the capture once.
-            lookup = request.get_all_taxes_values()
-            if lookup.get("error_message"):
-                raise ValidationError(
-                    self.env._("TaxCloud lookup failed during deferred capture: ")
-                    + lookup["error_message"]
+            if self._nw_taxcloud_already_captured(response):
+                # Idempotent: the tax IS captured at TaxCloud from an earlier
+                # attempt whose Odoo side rolled back. Fall through and mark it
+                # authorized -- raising here would leave the pending flag set
+                # and retry this same invoice forever (INV334415, every ~3 min
+                # from 07-24 until this fix).
+                _logger.info(
+                    "TaxCloud reports %s already captured (%s); marking authorized",
+                    self.name,
+                    self._nw_taxcloud_error_message(response),
                 )
-            response = request.get_taxcloud_authorize_with_capture(
-                self, reporting_date
-            )
-            if getattr(response, "ResponseType", None) == "Error":
-                raise ValidationError(response.Messages.ResponseMessage[0].Message)
+            else:
+                # The cart TaxCloud registered from the post-time Lookup may
+                # have aged out before this ran. Re-register it with a fresh
+                # Lookup (get_all_taxes_values only returns values -- it never
+                # edits the posted invoice) and retry the capture once.
+                lookup = request.get_all_taxes_values()
+                if lookup.get("error_message"):
+                    raise ValidationError(
+                        self.env._("TaxCloud lookup failed during deferred capture: ")
+                        + lookup["error_message"]
+                    )
+                response = request.get_taxcloud_authorize_with_capture(
+                    self, reporting_date
+                )
+                if getattr(response, "ResponseType", None) == "Error":
+                    if self._nw_taxcloud_already_captured(response):
+                        _logger.info(
+                            "TaxCloud reports %s already captured after "
+                            "re-lookup (%s); marking authorized",
+                            self.name,
+                            self._nw_taxcloud_error_message(response),
+                        )
+                    else:
+                        raise ValidationError(
+                            self._nw_taxcloud_error_message(response)
+                        )
         # Mark authorized so the account_taxcloud_enh dedup guard
         # (`not taxcloud_is_authorized`) never lets it be captured twice.
         if "taxcloud_is_authorized" in self._fields:
