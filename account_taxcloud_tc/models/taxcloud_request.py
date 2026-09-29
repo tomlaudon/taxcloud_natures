@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import re
+import time
 
 import requests
 
@@ -43,11 +44,34 @@ class TaxCloudRequest:
             "Zip5": zips.pop(0) if zips else "",
             "Zip4": zips.pop(0) if zips else "",
         }
-        res = requests.post(
-            "https://api.taxcloud.com/1.0/TaxCloud/VerifyAddress",
-            data=address_to_verify,
-            timeout=60,
-        ).json()
+        # A one-minute TaxCloud outage (2026-09-29 14:22, api.taxcloud.com
+        # unreachable) used to surface as a failed customer payment: the
+        # address check raised ConnectionError straight into the Auth wizard
+        # (SO2654580). Address verification is an accuracy step, not the tax
+        # lookup itself -- retry briefly, then continue with the unverified
+        # address exactly as TaxCloud's own "cannot verify" answer does.
+        res = None
+        for attempt in range(3):
+            try:
+                res = requests.post(
+                    "https://api.taxcloud.com/1.0/TaxCloud/VerifyAddress",
+                    data=address_to_verify,
+                    timeout=15,
+                ).json()
+                break
+            except (requests.exceptions.RequestException, ValueError) as exc:
+                _logger.warning(
+                    "TaxCloud VerifyAddress attempt %s/3 failed for partner #%s: %s",
+                    attempt + 1, partner.id, exc,
+                )
+                if attempt < 2:
+                    time.sleep(1 + attempt)
+        if res is None:
+            _logger.warning(
+                "TaxCloud VerifyAddress unreachable; using unverified address "
+                "for partner #%s", partner.id,
+            )
+            return dict(address_to_verify)
         if int(res.get("ErrNumber", False)):
             # If VerifyAddress fails, use Lookup with the initial address
             _logger.info(
