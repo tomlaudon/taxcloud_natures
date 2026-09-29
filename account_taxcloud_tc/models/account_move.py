@@ -18,9 +18,11 @@
 import datetime
 import logging
 
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE, TransactionRollbackError
+
 from odoo import _,api, fields, models
 from odoo.exceptions import UserError, ValidationError
-from odoo.tools import float_compare, float_round
+from odoo.tools import config, float_compare, float_round
 
 from .taxcloud_request import TaxCloudRequest
 
@@ -431,6 +433,16 @@ class AccountMove(models.Model):
                 with self.env.cr.savepoint():
                     invoice._nw_taxcloud_capture_report()
                     invoice.nw_taxcloud_capture_pending = False
+            except TransactionRollbackError as exc:
+                # The capture flag UPDATE lost to a concurrent writer on the
+                # same fresh invoice (pack-print worker, delivery-email cron,
+                # mail scheduler). The savepoint rolled it back and the flag
+                # is still pending; the next run retries. Not an ERROR.
+                _logger.warning(
+                    "Deferred TaxCloud capture for invoice %s (id %s) deferred "
+                    "to the next run after %s",
+                    invoice.name, invoice.id, type(exc).__name__,
+                )
             except Exception:
                 _logger.exception(
                     "Deferred TaxCloud capture failed for invoice %s (id %s); "
@@ -438,7 +450,23 @@ class AccountMove(models.Model):
                     invoice.name,
                     invoice.id,
                 )
+            # One transaction per invoice. A 200-invoice batch under a single
+            # REPEATABLE READ snapshot collided with every invoice touched by
+            # another writer after the batch started (5 collisions on
+            # 2026-09-29). Committing after each invoice keeps the snapshot
+            # seconds old, and the next transaction opens READ COMMITTED so
+            # the flag UPDATE waits for the row lock instead of failing.
+            self._nw_capture_next_transaction()
         return True
+
+    def _nw_capture_next_transaction(self):
+        if config["test_enable"]:
+            return
+        self.env.cr.commit()
+        cnx = getattr(self.env.cr, "_cnx", None)
+        if cnx is not None and cnx.info.transaction_status == TRANSACTION_STATUS_IDLE:
+            self.env.cr.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        self.env.cr.execute("SET LOCAL lock_timeout = '5s'")
 
     def _invoice_paid_hook(self):
         for invoice in self:
