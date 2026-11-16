@@ -1,7 +1,9 @@
 import hashlib
 import logging
 import re
+import threading
 import time
+from collections import OrderedDict
 
 import requests
 
@@ -13,6 +15,51 @@ from odoo.tools.zeep.exceptions import Fault
 _lt = LazyTranslate(__name__)
 
 _logger = logging.getLogger(__name__)
+
+# Successful VerifyAddress answers, per worker process.
+#
+# Every tax run verifies two addresses (the company's and the destination)
+# with an uncached HTTP call, and a Console order change runs tax about twice,
+# so an unchanged cart cost four VerifyAddress round trips per edit. The
+# answer depends only on the address sent, so a successful one is kept for
+# VERIFY_CACHE_TTL seconds, keyed on the normalised fields actually sent --
+# an edited address is a different key and is verified at once. Errors,
+# "cannot verify" answers and timeouts are never kept, so an outage does not
+# stick. Kept in process memory on purpose (like the tax lookup's ormcache):
+# no table, no migration, no write inside the order's transaction; each
+# worker verifies an address once per TTL.
+VERIFY_CACHE_TTL = 30 * 24 * 3600
+VERIFY_CACHE_MAX = 5000
+_VERIFY_CACHE = OrderedDict()
+_VERIFY_LOCK = threading.Lock()
+
+
+def _verify_cache_key(address_to_verify):
+    def norm(value):
+        return " ".join(str(value or "").split()).casefold()
+    return tuple(norm(address_to_verify.get(key)) for key in (
+        "apiLoginID", "apiKey", "Address1", "Address2", "City", "State", "Zip5", "Zip4"))
+
+
+def _verify_cache_get(key):
+    with _VERIFY_LOCK:
+        entry = _VERIFY_CACHE.get(key)
+        if not entry:
+            return None
+        stored_at, answer = entry
+        if time.monotonic() - stored_at > VERIFY_CACHE_TTL:
+            _VERIFY_CACHE.pop(key, None)
+            return None
+        _VERIFY_CACHE.move_to_end(key)
+        return dict(answer)
+
+
+def _verify_cache_put(key, answer):
+    with _VERIFY_LOCK:
+        _VERIFY_CACHE[key] = (time.monotonic(), dict(answer))
+        _VERIFY_CACHE.move_to_end(key)
+        while len(_VERIFY_CACHE) > VERIFY_CACHE_MAX:
+            _VERIFY_CACHE.popitem(last=False)
 
 
 class TaxCloudRequest:
@@ -44,6 +91,10 @@ class TaxCloudRequest:
             "Zip5": zips.pop(0) if zips else "",
             "Zip4": zips.pop(0) if zips else "",
         }
+        cache_key = _verify_cache_key(address_to_verify)
+        cached = _verify_cache_get(cache_key)
+        if cached is not None:
+            return cached
         # A one-minute TaxCloud outage (2026-09-29 14:22, api.taxcloud.com
         # unreachable) used to surface as a failed customer payment: the
         # address check raised ConnectionError straight into the Auth wizard
@@ -80,6 +131,8 @@ class TaxCloudRequest:
                 partner.id,
             )
             res.update(address_to_verify)
+        else:
+            _verify_cache_put(cache_key, res)
         return res
 
     def set_location_origin_detail(self, shipper):
