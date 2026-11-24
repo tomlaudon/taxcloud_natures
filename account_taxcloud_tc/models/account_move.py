@@ -566,6 +566,12 @@ class AccountMove(models.Model):
                 if not invoice.nw_taxcloud_paid_capture_state:
                     invoice.nw_taxcloud_paid_capture_state = "pending"
             elif invoice.move_type == "out_refund" and not getattr(invoice, "is_coupon_used", False):
+                # When installed, Sale Auth Flow owns the post-commit return
+                # report and reviews paid credits that have no posting receipt.
+                handle_return = getattr(invoice, "_nw_taxcloud_handle_paid_return", None)
+                if handle_return:
+                    handle_return()
+                    continue
                 origin_invoice = invoice.reversed_entry_id
                 if origin_invoice:
                     company = invoice.company_id
