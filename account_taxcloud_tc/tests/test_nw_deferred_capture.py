@@ -1,8 +1,16 @@
 from unittest.mock import Mock, patch
 
+from zeep.exceptions import Fault
+
+from odoo import Command
 from odoo.tests import tagged
 
 from .common import TestAccountTaxcloudCommon
+
+_PAID_CAPTURE_PATH = (
+    "odoo.addons.account_taxcloud_tc.models.taxcloud_request."
+    "TaxCloudRequest.get_taxcloud_captured"
+)
 
 _CAPTURE_PATH = (
     "odoo.addons.account_taxcloud_tc.models.taxcloud_request."
@@ -80,6 +88,76 @@ class TestNwDeferredCapture(TestAccountTaxcloudCommon):
             invoice.nw_taxcloud_capture_pending,
             "Pending flag should be cleared once the capture is sent.",
         )
+
+    def _reconcile_invoice(self, invoice):
+        receivable = invoice.line_ids.filtered(lambda line: line.account_type == "asset_receivable")
+        journal = self.env["account.journal"].search([
+            ("type", "=", "general"), ("company_id", "=", invoice.company_id.id),
+        ], limit=1)
+        offset = self.env["account.account"].search([
+            ("account_type", "=", "asset_cash"), ("company_ids", "in", invoice.company_id.ids),
+        ], limit=1)
+        entry = self.env["account.move"].create({
+            "journal_id": journal.id,
+            "line_ids": [
+                Command.create({"account_id": offset.id, "debit": receivable.balance}),
+                Command.create({"account_id": receivable.account_id.id, "credit": receivable.balance,
+                                "partner_id": invoice.partner_id.id}),
+            ],
+        })
+        entry.action_post()
+        (receivable | entry.line_ids.filtered(lambda line: line.account_id == receivable.account_id)).reconcile()
+
+    def test_paid_capture_waits_for_post_report_and_never_replays_fault(self):
+        invoices = self._post_pending_invoice() | self._post_pending_invoice()
+        held, accepted = invoices
+        with self.mock_taxcloud(), patch(_PAID_CAPTURE_PATH) as capture:
+            capture.side_effect = [Fault("SOAP provider SQL login problem"), Mock(ResponseType="OK")]
+            for invoice in invoices:
+                self._reconcile_invoice(invoice)
+                self.assertEqual(invoice.amount_residual, 0)
+            self.assertEqual(set(invoices.mapped("nw_taxcloud_paid_capture_state")), {"pending"})
+            capture.assert_not_called()
+
+            self.env["account.move"]._cron_taxcloud_paid_capture()
+            capture.assert_not_called()
+
+            invoices.nw_taxcloud_capture_pending = False
+            self.env["account.move"]._cron_taxcloud_paid_capture()
+            self.assertEqual([call.args[0] for call in capture.call_args_list], [held, accepted])
+            self.assertEqual(held.nw_taxcloud_paid_capture_state, "review")
+            self.assertEqual(accepted.nw_taxcloud_paid_capture_state, "sent")
+            self.assertEqual(held.amount_residual, 0)
+
+            invoices._invoice_paid_hook()
+            self.env["account.move"]._cron_taxcloud_paid_capture()
+            self.assertEqual(capture.call_count, 2)
+
+    def test_paid_capture_setup_failure_cools_down_and_does_not_block_next_invoice(self):
+        held, accepted = self._post_pending_invoice() | self._post_pending_invoice()
+        invoices = held | accepted
+        with self.mock_taxcloud():
+            for invoice in invoices:
+                self._reconcile_invoice(invoice)
+        invoices.nw_taxcloud_capture_pending = False
+
+        request = Mock()
+        request.get_taxcloud_captured.return_value = Mock(ResponseType="OK")
+        move_model = self.env["account.move"]
+        with patch("odoo.addons.account_taxcloud_tc.models.account_move.TaxCloudRequest",
+                   side_effect=[OSError("Local WSDL unavailable"), request, request]) as make_request:
+            move_model._cron_taxcloud_paid_capture()
+            self.assertEqual(held.nw_taxcloud_paid_capture_state, "pending")
+            self.assertTrue(held.nw_taxcloud_paid_capture_retry_at)
+            self.assertEqual(accepted.nw_taxcloud_paid_capture_state, "sent")
+            request.get_taxcloud_captured.assert_called_once_with(accepted)
+
+            move_model._cron_taxcloud_paid_capture()
+            self.assertEqual(make_request.call_count, 2)
+            held.nw_taxcloud_paid_capture_retry_at = False
+            move_model._cron_taxcloud_paid_capture()
+            self.assertEqual(held.nw_taxcloud_paid_capture_state, "sent")
+            self.assertEqual(request.get_taxcloud_captured.call_args.args, (held,))
 
     @staticmethod
     def _error_response(message):

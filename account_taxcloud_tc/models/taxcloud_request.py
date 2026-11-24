@@ -66,11 +66,11 @@ class TaxCloudRequest:
     """Low-level object intended to interface Odoo recordsets with TaxCloud,
     through appropriate SOAP requests"""
 
-    def __init__(self, api_id, api_key):
+    def __init__(self, api_id, api_key, *, operation_timeout=None):
         wsdl_path = (
             modules.get_module_path("account_taxcloud_tc") + "/api/taxcloud.wsdl"
         )
-        self.client = Client("file:///%s" % wsdl_path)
+        self.client = Client("file:///%s" % wsdl_path, operation_timeout=operation_timeout)
         self.factory = self.client.type_factory("ns0")
         self.api_login_id = api_id
         self.api_key = api_key

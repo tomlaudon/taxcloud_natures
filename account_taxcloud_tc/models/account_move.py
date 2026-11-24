@@ -17,6 +17,7 @@
 
 import datetime
 import logging
+import time
 
 from psycopg2.extensions import TRANSACTION_STATUS_IDLE, TransactionRollbackError
 
@@ -53,6 +54,21 @@ class AccountMove(models.Model):
     nw_taxcloud_capture_pending = fields.Boolean(
         string="TaxCloud Capture Pending", copy=False, index=True,
     )
+
+    nw_taxcloud_paid_capture_state = fields.Selection(
+        [
+            ("pending", "Pending"),
+            ("sending", "Sending — verify if interrupted"),
+            ("sent", "Sent"),
+            ("review", "Provider outcome needs review"),
+        ],
+        string="TaxCloud Paid Capture",
+        copy=False,
+        readonly=True,
+        index=True,
+    )
+
+    nw_taxcloud_paid_capture_retry_at = fields.Datetime(copy=False, readonly=True)
 
     def _post(self, soft=True):
         # OVERRIDE
@@ -468,47 +484,101 @@ class AccountMove(models.Model):
             self.env.cr.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         self.env.cr.execute("SET LOCAL lock_timeout = '5s'")
 
+    @api.model
+    def _cron_taxcloud_paid_capture(self, limit=25):
+        """Send the separate paid-time Captured report after payment commits.
+
+        Persist a claim before SOAP. A crash or uncertain provider response
+        leaves evidence for review and cannot automatically replay the call.
+        """
+        cr = self.env.cr
+        capture_fields = ["nw_taxcloud_paid_capture_state", "nw_taxcloud_paid_capture_retry_at"]
+        self.flush_model(capture_fields + ["nw_taxcloud_capture_pending", "state", "payment_state"])
+        deadline = time.monotonic() + 50
+        for _index in range(limit):
+            if time.monotonic() >= deadline:
+                return
+            cr.execute("""
+                SELECT id
+                  FROM account_move
+                 WHERE nw_taxcloud_paid_capture_state = 'pending'
+                   AND state = 'posted'
+                   AND payment_state IN ('paid', 'in_payment')
+                   AND NOT COALESCE(nw_taxcloud_capture_pending, FALSE)
+                   AND (nw_taxcloud_paid_capture_retry_at IS NULL
+                        OR nw_taxcloud_paid_capture_retry_at <= %s)
+                 ORDER BY id
+                 LIMIT 1 FOR UPDATE SKIP LOCKED
+            """, [fields.Datetime.now()])
+            row = cr.fetchone()
+            if row is None:
+                return
+            invoice = self.browse(row[0])
+            company = invoice.company_id
+            api_id, api_key = company.taxcloud_api_id, company.taxcloud_api_key
+            try:
+                # Initialization loads the local WSDL. No SOAP has been sent.
+                request = TaxCloudRequest(api_id, api_key, operation_timeout=15)
+            except (MemoryError, TransactionRollbackError):
+                raise
+            except Exception as exc:
+                _logger.warning(
+                    "TaxCloud paid Captured setup deferred for invoice %s (%s)",
+                    invoice.id, type(exc).__name__,
+                )
+                invoice.nw_taxcloud_paid_capture_retry_at = fields.Datetime.now() + datetime.timedelta(minutes=15)
+                invoice.flush_recordset(capture_fields)
+                self._nw_capture_next_transaction()
+                continue
+
+            invoice.write({
+                "nw_taxcloud_paid_capture_state": "sending",
+                "nw_taxcloud_paid_capture_retry_at": False,
+            })
+            self._nw_capture_next_transaction()
+            try:
+                response = request.get_taxcloud_captured(invoice)
+            except (MemoryError, TransactionRollbackError):
+                raise
+            except Exception as exc:
+                _logger.warning(
+                    "TaxCloud paid Captured needs review for invoice %s (%s)",
+                    invoice.id, type(exc).__name__,
+                )
+                invoice.nw_taxcloud_paid_capture_state = "review"
+            else:
+                if getattr(response, "ResponseType", None) == "OK":
+                    invoice.nw_taxcloud_paid_capture_state = "sent"
+                else:
+                    _logger.warning(
+                        "TaxCloud paid Captured returned no confirmation for invoice %s",
+                        invoice.id,
+                    )
+                    invoice.nw_taxcloud_paid_capture_state = "review"
+            invoice.flush_recordset(["nw_taxcloud_paid_capture_state"])
+            self._nw_capture_next_transaction()
+
     def _invoice_paid_hook(self):
         for invoice in self:
-            company = invoice.company_id
-            if invoice.fiscal_position_id.is_taxcloud:
-                api_id = company.taxcloud_api_id
-                api_key = company.taxcloud_api_key
-                request = TaxCloudRequest(api_id, api_key)
-                if invoice.move_type == "out_invoice":
-                    request.get_taxcloud_captured(invoice)
-                # Gift-card / loyalty discount credit notes (NW's
-                # is_coupon_used flag) aren't reversals of a taxable
-                # invoice — they're accounting moves that work alongside
-                # the original sale's gift-card payment. Tax was already
-                # charged on the actual sale amount, so taxcloud has
-                # nothing to do. Skip silently rather than logging a
-                # misleading "source document on the refund is not
-                # valid" WARN that AR sees on every loyalty refund.
-                elif getattr(invoice, 'is_coupon_used', False):
-                    continue
-                elif invoice.move_type == "out_refund":
+            if not invoice.fiscal_position_id.is_taxcloud:
+                continue
+            if invoice.move_type == "out_invoice":
+                if not invoice.nw_taxcloud_paid_capture_state:
+                    invoice.nw_taxcloud_paid_capture_state = "pending"
+            elif invoice.move_type == "out_refund" and not getattr(invoice, "is_coupon_used", False):
+                origin_invoice = invoice.reversed_entry_id
+                if origin_invoice:
+                    company = invoice.company_id
+                    request = TaxCloudRequest(company.taxcloud_api_id, company.taxcloud_api_key)
                     request.set_invoice_items_detail(invoice)
-                    origin_invoice = invoice.reversed_entry_id
-                    if origin_invoice:
-                        request.get_taxcloud_returned(origin_invoice, invoice.invoice_date)
-                    else:
-                        _logger.warning(
-                            """The source document on the refund %i is not valid"""
-                            """ and thus the refunded cart won't be logged on your"""
-                            """ taxcloud account""",
-                            invoice.id,
-                        )
-                # in_invoice / in_refund / entry / other move types:
-                # TaxCloud is sales-side only. Some vendor bills get
-                # tagged with a taxcloud fiscal_position by data quirk
-                # (the position-by-state default applies before the
-                # bill's vendor-vs-customer context is established), so
-                # they'd otherwise fall through to the refund branch and
-                # log a misleading "source document on the refund X is
-                # not valid" WARN. Skip silently.
+                    request.get_taxcloud_returned(origin_invoice, invoice.invoice_date)
                 else:
-                    continue
+                    _logger.warning(
+                        "The source document on the refund %i is not valid "
+                        "and thus the refunded cart won't be logged on your "
+                        "taxcloud account",
+                        invoice.id,
+                    )
 
         return super()._invoice_paid_hook()
 

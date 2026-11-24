@@ -42,4 +42,19 @@
             </xpath>
         </field>
     </record>
+    <record id="invoice_filter_taxcloud_paid_capture" model="ir.ui.view">
+        <field name="name">account.move.search.taxcloud.paid.capture</field>
+        <field name="model">account.move</field>
+        <field name="inherit_id" ref="account.view_account_invoice_filter" />
+        <field name="arch" type="xml">
+            <filter name="to_check" position="after">
+                <separator />
+                <filter name="taxcloud_paid_capture_review"
+                        string="TaxCloud Payment Notification Review"
+                        domain="[('move_type', '=', 'out_invoice'), ('nw_taxcloud_paid_capture_state', 'in', ('sending', 'review'))]"
+                        help="Verify the matching order in TaxCloud before considering a new notification." />
+                <separator />
+            </filter>
+        </field>
+    </record>
 </odoo>
